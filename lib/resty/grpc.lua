@@ -1,0 +1,245 @@
+local ffi        = require("ffi")
+local str_buf    = require("string.buffer")
+local cjson      = require("cjson")
+local resty_base = require("resty.core.base")
+local ffi_str    = ffi.string
+
+local sleep      = ngx.sleep
+local tcp        = ngx.socket.tcp
+local new_tab    = resty_base.new_tab
+
+
+ffi.cdef [[
+  typedef void* grpc_client;
+  typedef void *grpc_client_streaming_request_handle;
+  typedef void (*grpc_client_on_done)();
+  typedef void (*grpc_client_on_reply)(const char*, uintptr_t);
+
+  grpc_client grpc_client_new(const char* authority, const char* scheme);
+  int grpc_client_load_proto_file(grpc_client handle, const char *protos);
+  void grpc_client_loaded_protos(grpc_client handle);
+
+  int grpc_server_connect(grpc_client handle);
+
+  void grpc_client_connect(grpc_client handle);
+  void grpc_client_on_receive(grpc_client handle, const char *data, size_t n);
+
+  int grpc_drive_once(grpc_client handle);
+  size_t grpc_client_peek_write(grpc_client handle, char* out, size_t max_len);
+
+  // unary
+  void grpc_client_unary(grpc_client handle, const char* service, const char* method, const char* data, grpc_client_on_reply on_reply_cb);
+
+  // server streaming
+  void grpc_client_server_streaming(grpc_client handle, const char* service, const char* method, const char* data, grpc_client_on_reply on_reply_cb, grpc_client_on_done on_done_cb);
+
+  // client streaming
+  grpc_client_streaming_request_handle grpc_client_new_streaming_request(grpc_client handle, const char* service, const char* method);
+  void grpc_client_streaming_request_push(grpc_client_streaming_request_handle request_handle, const char* data);
+  void grpc_client_streaming_request_done(grpc_client_streaming_request_handle request_handle);
+  void grpc_client_client_streaming(grpc_client handle, const char* service, const char* method, grpc_client_streaming_request_handle request_handle, grpc_client_on_reply on_reply_cb);
+
+  // bidirectional streaming
+  void grpc_client_streaming(grpc_client handle, const char* service, const char* method, grpc_client_streaming_request_handle request_handle, grpc_client_on_reply cb, grpc_client_on_done on_done);
+]]
+
+local so_name = "librestygrpc.so"
+if ffi.os == "OSX" then
+  so_name = "librestygrpc.dylib"
+end
+local function load_shared_lib()
+  local tried_paths = new_tab(32, 0)
+  local i = 1
+
+  for k, _ in string.gmatch(package.cpath, "[^;]+") do
+    local fpath = string.match(k, "(.*/)")
+    fpath = fpath .. so_name
+
+    local f = io.open(fpath)
+    if f ~= nil then
+      io.close(f)
+      return ffi.load(fpath)
+    end
+    tried_paths[i] = fpath
+    i = i + 1
+  end
+
+  return nil, tried_paths
+end
+
+local C, tried_paths = load_shared_lib()
+if not C and tried_paths then
+  tried_paths[#tried_paths + 1] = 'tried above paths but can not load '
+      .. so_name
+  error(table.concat(tried_paths, '\r\n', 1, #tried_paths))
+end
+
+local _M = { _VERSION = '0.1.0' }
+local mt = { __index = _M }
+
+function _M.new(opts)
+  local cli = setmetatable({ tx_buf = str_buf.new() }, mt)
+
+  -- initialize TCP socket and connect
+  local sock = tcp()
+  sock:settimeouts(1000, 1000, 1)
+
+  local ok, err = sock:connect(opts.host, opts.port)
+  if not ok then
+    return nil, "failed to connect: " .. err
+  end
+
+  if opts.ssl then
+    _, err = sock:sslhandshake(true, opts.ssl_server_name or opts.host, opts.ssl_verify)
+    if err ~= nil then
+      return nil, "failed to do ssl handshake: " .. err
+    end
+  end
+
+  -- create grpc client
+  local authority = opts.host .. ":" .. opts.port
+  local scheme = opts.ssl and "https" or "http"
+  cli.grpc_client = C.grpc_client_new(authority, scheme)
+
+  -- load pre-defined proto files
+  for _, value in ipairs(opts.protos) do
+    C.grpc_client_load_proto_file(cli.grpc_client, value)
+  end
+
+  -- send HTTP2 handshake
+  C.grpc_client_connect(cli.grpc_client)
+
+  -- drive once to produce initial bytes to be sent
+  C.grpc_drive_once(cli.grpc_client)
+
+  -- start event loop
+  cli.evloop = ngx.thread.spawn(function()
+    while true do
+      -- take pending bytes from Rust-side buffer
+      -- TODO: use cdata ptr directly to avoid copy
+      local buf = ffi.new("uint8_t[?]", 1024)
+      local n = C.grpc_client_peek_write(cli.grpc_client, ffi.cast("char*", buf), 1024)
+      if n > 0 then
+        local data = ffi_str(buf, n)
+        cli.tx_buf:put(data)
+      end
+
+      -- send all bytes from Lua-side buffer
+      if #cli.tx_buf > 0 then
+        local data = cli.tx_buf:get()
+        local sent, err = sock:send(data)
+        if not sent and err == "closed" then
+          ngx.log(ngx.ERR, "failed to send data: ", err)
+          break
+        end
+
+        if sent > 0 then
+          cli.tx_buf:reset()
+          if sent < #data then
+            ngx.log(ngx.INFO, "partial send: ", sent, " of ", #data)
+            local remaining = data:sub(sent + 1)
+            cli.tx_buf:put(remaining)
+          end
+        end
+      end
+
+      local data, err = sock:receiveany(8192)
+      if not data and err == "closed" then
+        ngx.log(ngx.ERR, "socket closed")
+        break
+      end
+      if data and #data > 0 then
+        C.grpc_client_on_receive(cli.grpc_client, data, #data)
+        C.grpc_drive_once(cli.grpc_client)
+      end
+
+      sleep(0)
+    end
+  end)
+
+  return cli
+end
+
+function _M.unary(self, service, method, data)
+  local reply = nil
+  local on_reply_cb = ffi.cast("grpc_client_on_reply", function(ptr, n)
+    reply = ffi_str(ptr, n)
+  end)
+  C.grpc_client_unary(self.grpc_client, service, method, cjson.encode(data), on_reply_cb)
+  while reply == nil do
+    C.grpc_drive_once(self.grpc_client)
+    sleep(0)
+  end
+  return reply
+end
+
+function _M.server_streaming(self, service, method, data, on_message)
+  local done = false
+  local on_reply_cb = ffi.cast("grpc_client_on_reply", function(ptr, n)
+    on_message(ffi_str(ptr, n))
+  end)
+  local on_done_cb = ffi.cast("grpc_client_on_done", function() done = true end)
+  C.grpc_client_server_streaming(self.grpc_client, service, method, cjson.encode(data), on_reply_cb, on_done_cb)
+  while not done do
+    C.grpc_drive_once(self.grpc_client)
+    sleep(0)
+  end
+end
+
+function _M.new_streaming_request(self, service, method)
+  local handle = C.grpc_client_new_streaming_request(self.grpc_client, service, method)
+  if handle == nil then
+    return nil, "failed to create streaming request"
+  end
+
+  return setmetatable({ request = handle }, {
+    __index = {
+      send = function(sself, data)
+        C.grpc_client_streaming_request_push(sself.request, cjson.encode(data))
+        C.grpc_drive_once(self.grpc_client)
+      end,
+      done = function(sself)
+        C.grpc_client_streaming_request_done(sself.request)
+        C.grpc_drive_once(self.grpc_client)
+      end,
+      build = function(sself)
+        return sself.request
+      end,
+    }
+  })
+end
+
+function _M.client_streaming(self, service, method, request)
+  local reply = nil
+  local on_reply_cb = ffi.cast("grpc_client_on_reply", function(ptr, n)
+    reply = ffi_str(ptr, n)
+  end)
+  C.grpc_client_client_streaming(self.grpc_client, service, method, request:build(), on_reply_cb)
+  while reply == nil do
+    C.grpc_drive_once(self.grpc_client)
+    sleep(0)
+  end
+  return reply
+end
+
+function _M.streaming(self, service, method, request, on_message)
+  local done = false
+  local on_reply_cb = ffi.cast("grpc_client_on_reply", function(ptr, n)
+    on_message(ffi_str(ptr, n))
+  end)
+  local on_done_cb = ffi.cast("grpc_client_on_done", function() done = true end)
+  C.grpc_client_streaming(self.grpc_client, service, method, request:build(), on_reply_cb, on_done_cb)
+  while not done do
+    C.grpc_drive_once(self.grpc_client)
+    sleep(0)
+  end
+end
+
+function _M.close(self)
+  if self.evloop then
+    ngx.thread.kill(self.evloop)
+    self.evloop = nil
+  end
+end
+
+return _M
