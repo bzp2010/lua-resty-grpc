@@ -11,6 +11,8 @@ local tcp          = ngx.socket.tcp
 local is_exiting   = ngx.worker.exiting
 local table_new    = resty_base.new_tab
 local table_insert = table.insert
+local json_encode  = cjson.encode
+local json_decode  = cjson.decode
 
 
 ffi.cdef [[
@@ -271,7 +273,7 @@ function _M.unary(self, service, method, data)
     reply = ffi_str(ptr, n)
   end)
 
-  local _, err = ffi_call(grpc_client_unary, self.grpc_client, service, method, cjson.encode(data), on_reply_cb)
+  local _, err = ffi_call(grpc_client_unary, self.grpc_client, service, method, json_encode(data), on_reply_cb)
   if err then
     return nil, "failed to send unary request: " .. err
   end
@@ -279,7 +281,7 @@ function _M.unary(self, service, method, data)
     ffi_call(grpc_client_drive_once, self.grpc_client)
     sleep(0)
   end
-  return reply
+  return json_decode(reply)
 end
 
 function _M.server_streaming(self, service, method, data, on_message)
@@ -289,10 +291,11 @@ function _M.server_streaming(self, service, method, data, on_message)
 
   local done = false
   local on_reply_cb = ffi_cast("grpc_client_on_reply", function(ptr, n)
-    on_message(ffi_str(ptr, n))
+    local reply = ffi_str(ptr, n)
+    on_message(json_decode(reply))
   end)
   local on_done_cb = ffi_cast("grpc_client_on_done", function() done = true end)
-  local _, err = ffi_call(grpc_client_server_streaming, self.grpc_client, service, method, cjson.encode(data),
+  local _, err = ffi_call(grpc_client_server_streaming, self.grpc_client, service, method, json_encode(data),
     on_reply_cb, on_done_cb)
   if err then
     return nil, "failed to send server streaming request: " .. err
@@ -312,7 +315,7 @@ function _M.new_streaming_request(self, service, method)
   return setmetatable({ request = handle }, {
     __index = {
       send = function(sself, data)
-        ffi_call(grpc_client_streaming_request_push, sself.request, cjson.encode(data))
+        ffi_call(grpc_client_streaming_request_push, sself.request, json_encode(data))
         ffi_call(grpc_client_drive_once, self.grpc_client)
       end,
       done = function(sself)
@@ -350,7 +353,7 @@ function _M.client_streaming(self, service, method, request)
     ffi_call(grpc_client_drive_once, self.grpc_client)
     sleep(0)
   end
-  return reply
+  return json_decode(reply)
 end
 
 function _M.streaming(self, service, method, request, on_message)
@@ -360,7 +363,8 @@ function _M.streaming(self, service, method, request, on_message)
 
   local done = false
   local on_reply_cb = ffi_cast("grpc_client_on_reply", function(ptr, n)
-    on_message(ffi_str(ptr, n))
+    local reply = ffi_str(ptr, n)
+    on_message(json_decode(reply))
   end)
   local on_done_cb = ffi_cast("grpc_client_on_done", function() done = true end)
   local _, err = ffi_call(grpc_client_streaming, self.grpc_client, service, method, request:build(), on_reply_cb,
