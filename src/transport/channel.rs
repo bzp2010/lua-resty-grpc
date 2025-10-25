@@ -124,7 +124,7 @@ impl Channel {
 
         match frame.into_data() {
           Ok(data) => {
-            if let Err(_) = Self::send_data_chunk(&mut send_stream, data).await {
+            if Self::send_data_chunk(&mut send_stream, data).await.is_err() {
               break;
             }
           }

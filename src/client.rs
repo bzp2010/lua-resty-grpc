@@ -30,14 +30,6 @@ impl GrpcStreamingRequest {
     }
   }
 
-  /// Restore GrpcStreamingRequest from raw pointer
-  pub unsafe fn from_ptr<'a>(
-    ptr: crate::grpc_client_streaming_request_handle,
-  ) -> Option<&'a mut GrpcStreamingRequest> {
-    let req_box = unsafe { &mut *(ptr as *mut Option<GrpcStreamingRequest>) };
-    req_box.as_mut()
-  }
-
   /// Get the message descriptor associated with this request
   pub fn get_message_descriptor(&self) -> &MessageDescriptor {
     &self.message_descriptor
@@ -95,12 +87,6 @@ pub struct GrpcClient {
 }
 
 impl GrpcClient {
-  /// Restore GrpcClient from raw pointer
-  pub unsafe fn from_ptr<'a>(ptr: crate::grpc_client) -> Option<&'a mut GrpcClient> {
-    let client_box = unsafe { &mut *(ptr as *mut Option<GrpcClient>) };
-    client_box.as_mut()
-  }
-
   /// Add service and method descriptors from a protobuf FileDescriptor
   /// This builds the internal mapping of service names to their methods
   pub fn add_service_and_method(&mut self, fd: FileDescriptor) {

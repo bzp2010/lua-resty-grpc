@@ -1,14 +1,14 @@
 use std::rc::Rc;
 
 use bytes::{Buf, BufMut, Bytes};
-use protobuf::MessageDyn;
+use protobuf::{MessageDyn, reflect::MethodDescriptor};
 
 pub struct MyCodec {
-  md: Rc<protobuf::reflect::MethodDescriptor>,
+  md: Rc<MethodDescriptor>,
 }
 
 impl MyCodec {
-  pub fn new(md: Rc<protobuf::reflect::MethodDescriptor>) -> Self {
+  pub fn new(md: Rc<MethodDescriptor>) -> Self {
     Self { md }
   }
 }
@@ -48,7 +48,7 @@ impl tonic::codec::Encoder for MyEncoder {
 }
 
 pub struct MyDecoder {
-  md: Rc<protobuf::reflect::MethodDescriptor>,
+  md: Rc<MethodDescriptor>,
 }
 
 impl tonic::codec::Decoder for MyDecoder {
