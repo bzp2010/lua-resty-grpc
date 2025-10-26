@@ -301,7 +301,7 @@ end
 
 function _M.server_streaming(self, service, method, data, on_message)
   if self.closed then
-    return nil, "grpc client is closed"
+    return "grpc client is closed"
   end
 
   local done = false
@@ -313,7 +313,7 @@ function _M.server_streaming(self, service, method, data, on_message)
   local _, err = ffi_call(grpc_client_server_streaming, self.grpc_client, service, method, json_encode(data),
     on_reply_cb, on_done_cb)
   if err then
-    return nil, "failed to send server streaming request: " .. err
+    return "failed to send server streaming request: " .. err
   end
   while not is_exiting() and not done do
     ffi_call(grpc_client_drive_once, self.grpc_client)
@@ -373,7 +373,7 @@ end
 
 function _M.streaming(self, service, method, request, on_message)
   if self.closed then
-    return nil, "grpc client is closed"
+    return "grpc client is closed"
   end
 
   local done = false
@@ -385,7 +385,7 @@ function _M.streaming(self, service, method, request, on_message)
   local _, err = ffi_call(grpc_client_streaming, self.grpc_client, service, method, request:build(), on_reply_cb,
     on_done_cb)
   if err then
-    return nil, "failed to send streaming request: " .. err
+    return "failed to send streaming request: " .. err
   end
   while not is_exiting() and not done do
     ffi_call(grpc_client_drive_once, self.grpc_client)
