@@ -161,7 +161,7 @@ function _M.new(opts)
   end
 
   -- set metatable for client methods and gc
-  local cli = setmetatable({ tx_buf = str_buf.new(), grpc_client = handle }, {
+  local cli = setmetatable({ tx_buf = str_buf.new(), grpc_client = handle, closed = false }, {
     __index = _M,
     __gc = function(self)
       ngx.log(ngx.DEBUG, "freeing grpc client: ", tostring(self.grpc_client))
@@ -206,8 +206,12 @@ function _M.new(opts)
   ffi_call(grpc_client_drive_once, cli.grpc_client)
 
   -- start event loop
-  cli.evloop = ngx.thread.spawn(function()
+  cli.write_evloop = ngx.thread.spawn(function()
     while not is_exiting() do
+      if cli.closed then
+        break
+      end
+
       -- take pending bytes from Rust-side buffer
       -- TODO: use cdata ptr directly to avoid copy
       local buf = ffi_new("uint8_t[?]", 1024)
@@ -238,6 +242,17 @@ function _M.new(opts)
             cli.tx_buf:put(remaining)
           end
         end
+      end
+      sleep(0)
+    end
+
+    cli:close()
+  end)
+
+  cli.read_evloop = ngx.thread.spawn(function()
+    while not is_exiting() do
+      if cli.closed then
+        break
       end
 
       local data, err = sock:receiveany(8192)
@@ -380,9 +395,13 @@ end
 
 function _M.close(self)
   self.closed = true
-  if self.evloop then
-    ngx.thread.kill(self.evloop)
-    self.evloop = nil
+  if self.write_evloop then
+    ngx.thread.kill(self.write_evloop)
+    self.write_evloop = nil
+  end
+  if self.read_evloop then
+    ngx.thread.kill(self.read_evloop)
+    self.read_evloop = nil
   end
 end
 
